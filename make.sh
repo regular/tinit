@@ -1,14 +1,7 @@
 set -e
 
-source ~/.tisl/sdks/5.30.00.03.env
-COMPILER=ccs
-
-#source ~/.tisl/sdks/7.10.00.98.env
-#COMPILER=ticlang
-
-#source ~/.tisl/sdks/6.40.00.13.env
-#COMPILER=ticlang
-
+source ~/.tisl/sdks/__SDKVERSION__.env # set by tinit
+COMPILER=__COMPILER__ # set by tinit
 RTOS=$TIRTOSNAME
 
 # for old SDK versions, we need to make the kernel separately
@@ -23,4 +16,3 @@ make -C app/$RTOS/$COMPILER
 
 OUT=app/$RTOS/$COMPILER/*.out
 ls -l $OUT
-

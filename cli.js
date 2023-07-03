@@ -2,7 +2,7 @@
 //jshint -W083
 const conf = require('rc')('tinit')
 const fs = require('fs')
-const {readdir, stat} = require('fs/promises')
+const {readdir, stat, chmod, exists} = require('fs/promises')
 const {join, parse, relative} = require('path')
 const {mkdirp} = require('mkdirp')
 const loner = require('loner')
@@ -11,7 +11,8 @@ const Git = require('./git')
 
 async function main() {
   const SDK = process.env.TISL_SDK
-  if (!SDK) bail(new Error('Please use "source <(tisl env SDK_VERSION) to select an SDK'))
+  const VERSION = process.env.TISL_SDKVERSION
+  if (!SDK || !VERSION) bail(new Error('Please use "source <(tisl env SDK_VERSION) to select an SDK'))
 
   if (conf._[0] == 'ls') {
     return listExamples(conf)
@@ -19,43 +20,58 @@ async function main() {
 
   if (conf._.length !== 2) {
     usage()
-    bail(new Error('Not enough arguments'))
+    return bail(new Error('Not enough arguments'))
   }
 
-  const [src, newname] = conf._
-  const {base, dir} = parse(src)
-  const source = `${SDK}/examples/rtos/${process.env.BOARDNAME}/${dir}/${base}`
-  const dest = newname
+  let [src, dest] = conf._
+  const parsedSrc = parse(src)
+  const exampleName = parsedSrc.base
+  const exampleDir = parsedSrc.dir
+  src = `${SDK}/examples/rtos/${process.env.BOARDNAME}/${exampleDir}/${exampleName}`
+  if (!fs.existsSync(src)) return bail(new Error(`${src} does not exist.`))
 
-  console.log(`Copying ${source} to ${dest}`)
+  const parsedDest = parse(dest)
+  const newname = parsedDest.base
+  if (!newname.match(/^[a-zA-Z0-9_]+$/)) {
+    return bail(new Error(`project name must be a valid C identifier.`))
+  }
+
+  console.log(`Copying ${src} to ${dest}`)
 
   const git = Git(dest)
-  await findFiles(source, {action: copyFilesTo(join(dest, 'app'))})
+  await findFiles(src, {action: copyFilesTo(join(dest, 'app'))})
   let lines = await git.init()
   if (!lines[0].startsWith('Initialized')) {
     console.error(lines)
     process.exit(1)
   }
   await git.add('.')
-  const prettySrcPath = relative(parse(SDK).dir, source)
+  const prettySrcPath = relative(parse(SDK).dir, src)
   await git.commit(`Verbatim copy from ${prettySrcPath} to app/`)
 
-  // TODO: only for 5.00
-  await findFiles(join(SDK, 'kernel'), {action: copyFilesTo(join(dest, 'kernel'))})
-  await git.add('kernel')
-  await git.commit(`Add kernel from SDK`)
+  if (VERSION < '5.30.01.00') {
+    await findFiles(join(SDK, 'kernel'), {action: copyFilesTo(join(dest, 'kernel'))})
+    await git.add('kernel')
+    await git.commit(`Add kernel from SDK`)
+  }
 
   await rimraf(join(dest, 'app'))
-  await findFiles(source, {oldname: base, newname, action: copyFilesTo(join(dest, 'app'))})
+  await findFiles(src, {oldname: exampleName, newname, action: copyFilesTo(join(dest, 'app'))})
   await git.add('.')
   await git.commit(`Rename files to match new application name "${newname}"`)
 
-  await findFiles(source, {replace: {find: base, replaceWith: newname}, oldname: base, newname, action: copyFilesTo(join(dest, 'app'))})
+  await findFiles(src, {replace: {find: exampleName, replaceWith: newname}, oldname: exampleName, newname, action: copyFilesTo(join(dest, 'app'))})
   await git.add('.')
-  await git.commit(`Search and replace in files (risky!). "${base}" becomes "${newname}"`)
+  await git.commit(`Search and replace in files (risky!). "${exampleName}" becomes "${newname}"`)
 
   await copyFile(join(SDK, 'imports.mak'), join(dest, 'imports.mak'))
-  await copyFile(join(__dirname, 'make.sh'), join(dest, 'make.sh'))
+  await copyFile(join(__dirname, 'make.sh'), join(dest, 'make.sh'), {
+    replace: [
+      {find: '__SDKVERSION__', replaceWith: VERSION},
+      {find: '__COMPILER__', replaceWith: VERSION < '5.30.01.00' ? 'ccs' : 'ticlang'},
+    ]
+  })
+  await chmod(join(dest, 'make.sh'), 0774)
   await git.add(['imports.mak', 'make.sh'])
   await git.commit('Add imports.mak from SDK root and make.sh')
 }
@@ -68,8 +84,8 @@ async function listExamples(opts) {
   opts = opts || {}
   const collections = 'boardname rtos compiler'.split(' ')
   const depth = 8
-  const source = `${process.env.TISL_SDK}/examples`
-  const list = await findFiles(source, {depth})
+  const src = `${process.env.TISL_SDK}/examples`
+  const list = await findFiles(src, {depth})
   const paths = list.flat(depth).map( ({src})=>src.split('/').slice(-depth))
   let examples = paths.filter(ps=>ps.slice(-1)[0].toLowerCase() == 'makefile' && ps[0] == 'examples')
   examples = examples.map(ex=>{
@@ -115,13 +131,13 @@ function copyFilesTo(dest) {
   }
 }
 
-async function findFiles(source, opts) {
+async function findFiles(src, opts) {
   opts = opts || {}
-  if (!opts.root) opts.root = source
+  if (!opts.root) opts.root = src
   const {action} = opts
-  const files = await readdir(source)
+  const files = await readdir(src)
   return Promise.all(files.map(async file=>{
-    const p = join(source, file)
+    const p = join(src, file)
     const s = await stat(p)
     if (s.isDirectory()) {
       if (opts.depth == undefined || opts.depth > 0) {
@@ -137,15 +153,17 @@ async function findFiles(source, opts) {
 
 function copyFile(p, destname, opts) {
   opts = opts || {}
-  opts.replace = opts.replace || {}
-  const oldname = opts.replace.find, newname = opts.replace.replaceWith
+
   return new Promise( (resolve, reject)=>{
     const ws = fs.createWriteStream(destname)
     let rs
-    if (oldname && newname) {
-      rs = fs.createReadStream(p).pipe(loner(opts.oldname))
+    if (opts.replace) {
+      const r = ary(opts.replace)
+      const seqs = r.map(({find})=>find)
+      rs = fs.createReadStream(p).pipe(loner.apply(null, seqs))
         .on('data', data=>{
-          if (data == opts.oldname) data = opts.newname
+          const found = r.find(({find})=>data == find)
+          if (found) data = found.replaceWith
           process.stdout.write('(r)')
           ws.write(data)
         })
@@ -176,4 +194,9 @@ function bail(err) {
   if (!err) return
   console.error(err.message)
   process.exit(1)
+}
+
+function ary(x) {
+  if (Array.isArray(x)) return x
+  return [x]
 }
